@@ -1,0 +1,615 @@
+# AI Agent 工程师学习笔记
+
+> 技术栈：Vercel AI SDK v7 + TypeScript + Alibaba Qwen
+
+---
+
+## 工具链
+
+### tsx vs tsc vs ts-node
+
+| 工具 | 底层 | 类型检查 | 直接运行 | 速度 |
+|---|---|---|---|---|
+| `tsx` | esbuild (Go) | ❌ | ✅ | 极快（毫秒） |
+| `tsc` | TS 编译器 | ✅ | ❌ | 慢（秒级） |
+| `ts-node` | TS 编译器 | ✅（可关） | ✅ | 慢 |
+
+**结论**：开发阶段用 `tsx`，提交前用 `tsc --noEmit` 做类型检查，生产构建用 `tsc`。`ts-node` 是上一代方案，新项目不用。
+
+---
+
+## 第一课：LLM 调用基础
+
+### generateText
+
+一次性生成，等待完整结果：
+
+```ts
+import { generateText } from 'ai';
+import { createAlibaba } from '@ai-sdk/alibaba';
+
+const alibaba = createAlibaba({ apiKey: process.env.alibaba_api_key });
+
+const { text } = await generateText({
+  model: alibaba('qwen-max'),
+  prompt: '用一句话解释什么是机器学习',
+});
+```
+
+结果对象常用字段：
+- `result.text` — 最终生成的文本
+- `result.usage` — token 用量 `{ inputTokens, outputTokens }`
+- `result.finishReason` — 停止原因：`"stop"` | `"length"` | `"tool-calls"`
+
+### streamText
+
+流式输出，实时返回每个 chunk：
+
+```ts
+import { streamText } from 'ai';
+
+const result = streamText({
+  model: alibaba('qwen-max'),
+  prompt: '写一首短诗',
+});
+
+for await (const chunk of result.textStream) {
+  process.stdout.write(chunk);
+}
+```
+
+注意：`streamText` 不加 `await`，立即返回对象，等待在 `for await` 里。
+
+### instructions vs prompt
+
+```ts
+await generateText({
+  model: alibaba('qwen-max'),
+  instructions: '你是一名严格的代码审查员',  // system prompt，设定角色
+  prompt: '帮我审查这段代码',                // user message，实际输入
+});
+```
+
+---
+
+## 第二课：结构化输出
+
+### 核心思路
+
+用 Zod 定义数据结构，让 LLM 直接返回类型安全的对象，而不是需要手动解析的文字。
+
+### Output.object()
+
+```ts
+import { generateText, Output } from 'ai';
+import { z } from 'zod';
+
+const { output } = await generateText({
+  model: alibaba('qwen-max'),
+  output: Output.object({
+    schema: z.object({
+      name: z.string().describe('姓名'),
+      age: z.number().describe('年龄'),
+      skills: z.array(z.string()).describe('技能列表'),
+    }),
+  }),
+  prompt: '生成一个前端工程师的信息',
+});
+
+console.log(output.name);   // 类型安全，TypeScript 知道是 string
+console.log(output.skills); // 类型安全，TypeScript 知道是 string[]
+```
+
+### 四种 Output 类型
+
+| 类型 | 用途 |
+|---|---|
+| `Output.object()` | 返回一个对象（最常用） |
+| `Output.array()` | 返回数组 |
+| `Output.choice()` | 从给定选项中选一个（分类任务） |
+| `Output.json()` | 返回任意 JSON，不验证结构 |
+
+### .describe() 提升生成质量
+
+在 schema 字段上加描述，告诉 LLM 每个字段的含义：
+
+```ts
+z.object({
+  cookTime: z.number().describe('烹饪时间，单位：分钟'),
+  difficulty: z.enum(['简单', '中等', '困难']).describe('制作难度'),
+})
+```
+
+### ⚠️ Qwen 踩坑记录
+
+**坑1：模型返回中文 key，schema 定义英文 key**
+
+原因：prompt 用中文描述，模型用中文作为 JSON key。
+
+修法：prompt 里明确指定英文 key，或 schema 也改成中文 key。
+
+**坑2：Qwen 不支持嵌套对象 schema**
+
+现象：`mostRecentJob: { company, position }` 这种嵌套结构，Qwen 会打平成 `mostRecentJob的公司`、`mostRecentJob的职位`。
+
+修法：把嵌套拍平：
+
+```ts
+z.object({
+  recentCompany: z.string(),   // ✅ 扁平
+  recentPosition: z.string(),  // ✅ 扁平
+})
+```
+
+**坑3：Output.array() 包装格式问题**
+
+AI SDK 期望模型返回 `{ "elements": [...] }`，但 Qwen 直接返回 `[...]`。
+
+修法：统一用 `Output.object()` 套一层数组：
+
+```ts
+Output.object({
+  schema: z.object({
+    results: z.array(z.enum(['正面', '负面', '中性'])),
+  }),
+})
+```
+
+**核心经验**：schema 设计要贴合模型的实际输出能力，越扁平越稳定。能力弱的模型避免嵌套对象、复杂联合类型。
+
+### 结构化数据能流式输出吗？
+
+可以，但有限制：
+- `Output.object()` → 用 `partialOutputStream`，推来的是不完整的对象
+- `Output.array()` → 用 `elementStream`，每次推来一个完整的元素
+- `Output.choice()` → 不支持流式（就一个词，没意义）
+
+实际场景里大多数不需要流式结构化输出，等完整结果处理更简单。
+
+---
+
+## 第三课：Tool Calling
+
+### 核心概念
+
+LLM 本身不能执行代码、查实时数据。Tool 解决这个问题：**你写执行逻辑，LLM 决定什么时候调用、传什么参数**。
+
+### Tool 结构
+
+```ts
+import { tool } from 'ai';
+import { z } from 'zod';
+
+const weatherTool = tool({
+  description: '获取某个城市的实时天气',  // LLM 靠这个判断要不要调用
+  inputSchema: z.object({
+    city: z.string().describe('城市名'),
+  }),
+  execute: async ({ city }) => {           // 你的真实逻辑
+    return { temperature: 25, condition: '晴天' };
+  },
+});
+```
+
+### 执行流程
+
+```
+prompt → LLM 决定调用工具 + 生成参数
+       → SDK 自动执行 execute()
+       → 结果回传给 LLM
+       → LLM 生成最终回答
+```
+
+### 使用方式
+
+```ts
+import { generateText, tool, isStepCount } from 'ai';
+
+const { text, steps } = await generateText({
+  model: alibaba('qwen-max'),
+  tools: { weatherTool },
+  stopWhen: isStepCount(5),  // 必须加，防止只跑一步就停
+  prompt: '北京今天天气怎么样？',
+});
+```
+
+### 查看工具调用过程
+
+```ts
+for (const step of steps) {
+  for (const part of step.content) {
+    if (part.type === 'tool-call') {
+      console.log('调用工具:', part.toolName);
+      console.log('传入参数:', part.input);
+    }
+    if (part.type === 'tool-result') {
+      console.log('工具结果:', part.output);
+    }
+    if (part.type === 'text') {
+      console.log('模型回答:', part.text);
+    }
+  }
+}
+```
+
+**注意**：直接 `console.log(steps)` 只能看到顶层，`content: [[Object]]` 是折叠的，必须展开 `content` 数组才能看到工具调用细节。
+
+### toolChoice 控制工具使用
+
+```ts
+toolChoice: 'auto'      // 默认，LLM 自己决定
+toolChoice: 'required'  // 强制必须调用工具
+toolChoice: 'none'      // 禁止调用工具
+toolChoice: { type: 'tool', toolName: 'weather' }  // 强制指定工具
+```
+
+---
+
+## 第四课：ToolLoopAgent
+
+### 为什么需要 ToolLoopAgent
+
+`generateText + tools` 是底层原语，每次调用都要重复写 model、instructions、tools 配置。`ToolLoopAgent` 把这些打包成可复用的对象。
+
+```ts
+import { ToolLoopAgent, isStepCount } from 'ai';
+
+const agent = new ToolLoopAgent({
+  model: alibaba('qwen-max'),
+  instructions: '你是一个专业的理财顾问',
+  tools: { getStockPrice, calculateReturn },
+  stopWhen: isStepCount(10),
+});
+
+// 定义一次，到处用
+const result = await agent.generate({ prompt: '...' });
+```
+
+### 三种调用方式
+
+```ts
+// 等待完整结果
+const result = await agent.generate({ prompt: '...' });
+
+// 流式输出
+const result = await agent.stream({ prompt: '...' });
+for await (const chunk of result.textStream) { ... }
+
+// Next.js API Route（下一课讲）
+return createAgentUIStreamResponse({ agent, uiMessages: messages });
+```
+
+### 生命周期回调
+
+```ts
+const result = await agent.generate({
+  prompt: '...',
+  onToolExecutionStart({ toolCall }) {
+    console.log(`▶ 调用: ${toolCall.toolName}`, toolCall.input);
+  },
+  onToolExecutionEnd({ toolCall, toolExecutionMs }) {
+    console.log(`✓ 完成: ${toolCall.toolName} (${toolExecutionMs}ms)`);
+  },
+  onEnd({ usage, steps }) {
+    console.log(`共 ${steps.length} 步，${usage.totalTokens} tokens`);
+  },
+});
+```
+
+### generateText vs ToolLoopAgent 怎么选
+
+| 场景 | 用什么 |
+|---|---|
+| 一次性脚本、测试 | `generateText` |
+| 需要复用的 Agent | `ToolLoopAgent` |
+| Next.js API Route | `ToolLoopAgent` |
+| 自定义多步骤流程、动态换模型 | `generateText`（更灵活） |
+
+**关系**：`generateText` 是积木，`ToolLoopAgent` 是用积木拼好的常用零件。大多数生产场景直接用 `ToolLoopAgent`。
+
+---
+
+## 第五课：Memory
+
+### 三种 Memory 方案
+
+| 方案 | 适合场景 |
+|---|---|
+| 对话历史（messages 数组） | 单次会话内记忆，零依赖 |
+| Memory 服务（Mem0 等） | 跨会话持久记忆，接入简单 |
+| 自定义 Tool | 生产级定制，完全控制存储 |
+
+### 方案一：对话历史
+
+```ts
+type Message = { role: 'user' | 'assistant'; content: string };
+const history: Message[] = [];
+
+async function chat(userInput: string) {
+  history.push({ role: 'user', content: userInput });
+  const result = await agent.generate({ messages: history });
+  history.push({ role: 'assistant', content: result.text });
+  return result.text;
+}
+```
+
+局限：历史越长 token 越多，超过 20 轮考虑截断。
+
+### 命令行连续对话
+
+```ts
+import * as readline from 'readline';
+
+const rl = readline.createInterface({
+  input: process.stdin,
+  output: process.stdout,
+});
+
+function ask() {
+  rl.question('你: ', async (input) => {
+    const trimmed = input.trim();
+    if (trimmed === 'q') {
+      rl.close();
+      process.exit(0);  // 强制退出，避免进程挂起
+    }
+    const reply = await chat(trimmed);
+    console.log(`\nAgent: ${reply}\n`);
+    ask(); // 递归，实现连续对话
+  });
+}
+
+ask();
+```
+
+---
+
+## 第六课：Next.js 全栈集成
+
+### 整体架构
+
+```
+浏览器 (useChat hook)
+    ↕ HTTP 流式响应
+Next.js API Route
+    ↕
+ToolLoopAgent
+    ↕
+LLM
+```
+
+### 后端 API Route
+
+```ts
+// app/api/chat/route.ts
+import { createAgentUIStreamResponse, UIMessage } from 'ai';
+import { ToolLoopAgent } from 'ai';
+
+const agent = new ToolLoopAgent({
+  model: alibaba('qwen-max'),
+  instructions: '你是一个友好的助手',
+});
+
+export async function POST(req: Request) {
+  const { messages }: { messages: UIMessage[] } = await req.json();
+
+  return createAgentUIStreamResponse({
+    agent,
+    uiMessages: messages,  // 内部自动转换格式，不需要 convertToModelMessages
+  });
+}
+```
+
+### 前端 useChat
+
+```tsx
+'use client';
+import { useChat } from '@ai-sdk/react';
+import { DefaultChatTransport } from 'ai';
+import { useState } from 'react';
+
+export default function Page() {
+  const { messages, sendMessage, status, stop } = useChat({
+    transport: new DefaultChatTransport({ api: '/api/chat' }),
+  });
+  const [input, setInput] = useState('');
+
+  return (
+    <div>
+      {messages.map(message => (
+        <div key={message.id}>
+          <strong>{message.role === 'user' ? '你' : 'AI'}：</strong>
+          {message.parts.map((part, i) =>
+            part.type === 'text' ? <span key={i}>{part.text}</span> : null
+          )}
+        </div>
+      ))}
+
+      {status === 'streaming' && (
+        <button onClick={stop}>停止</button>
+      )}
+
+      <form onSubmit={e => {
+        e.preventDefault();
+        if (input.trim()) {
+          sendMessage({ text: input });
+          setInput('');
+        }
+      }}>
+        <input
+          value={input}
+          onChange={e => setInput(e.target.value)}
+          disabled={status !== 'ready'}  // 注意：是 !== 不是 ===
+        />
+        <button disabled={status !== 'ready'}>发送</button>
+      </form>
+    </div>
+  );
+}
+```
+
+### status 四个状态
+
+| 状态 | 含义 |
+|---|---|
+| `ready` | 空闲，可以发消息 |
+| `submitted` | 消息已发出，等待响应 |
+| `streaming` | 正在接收流式数据 |
+| `error` | 出错了 |
+
+### 渲染消息用 parts 不用 content
+
+```tsx
+message.parts.map((part, i) => {
+  if (part.type === 'text') return <span key={i}>{part.text}</span>;
+  if (part.type === 'tool-invocation') return <div key={i}>工具调用中...</div>;
+  return null;
+})
+```
+
+一条消息可能包含文字 + 工具调用 + 工具结果，`parts` 把它们分开表示。
+
+### convertToModelMessages 什么时候用
+
+- 用 `createAgentUIStreamResponse` → **不需要**，内部自动转换
+- 用 `streamText` 手动处理 → **需要**手动调用
+
+### stop() 真的能停止后端吗
+
+前端 `stop()` 只是断开 HTTP 连接，后端 LLM 调用默认**继续跑**。
+
+- 用 `createAgentUIStreamResponse` → 自动绑定 `abortSignal`，stop() 真正有效
+- 用 `streamText` 手动处理 → 需要手动传 `abortSignal: req.signal`
+
+---
+
+## 第七课：RAG（检索增强生成）
+
+### 核心思路
+
+LLM 不知道你的私有数据，RAG 的解法：**先搜索相关内容，再把内容塞进 prompt**。
+
+### 向量 + 相似度
+
+文字转成向量（数字数组），语义相近的文字向量距离近：
+
+```ts
+import { embed, embedMany, cosineSimilarity } from 'ai';
+
+// 单个向量化
+const { embedding } = await embed({
+  model: alibaba.textEmbeddingModel('text-embedding-v3'),
+  value: '苹果很好吃',
+});
+// embedding 是 1536 个数字组成的数组
+
+// 批量向量化
+const { embeddings } = await embedMany({
+  model: alibaba.textEmbeddingModel('text-embedding-v3'),
+  values: ['文档块1', '文档块2', '文档块3'],
+});
+
+// 相似度计算（-1 到 1，越接近 1 越相似）
+const similarity = cosineSimilarity(embeddings[0], embeddings[1]);
+```
+
+### 完整 RAG 流程
+
+```
+阶段一（离线建库）：
+文档 → 切块 → embedMany 向量化 → 存入内存/向量数据库
+
+阶段二（每次查询）：
+用户问题 → embed 向量化 → cosineSimilarity 找最相关的块
+         → 拼进 prompt → LLM 生成回答
+```
+
+### cosineSimilarity 计算公式
+
+余弦相似度衡量两个向量的**方向相似程度**，与向量长度无关：
+
+```
+cosine_similarity(A, B) = (A · B) / (|A| × |B|)
+
+A · B  = A[0]×B[0] + A[1]×B[1] + ... + A[n]×B[n]  （点积）
+|A|    = √(A[0]² + A[1]² + ... + A[n]²)             （模长）
+```
+
+- 结果范围：**-1 到 1**
+- `1`  → 方向完全相同，语义极度相似
+- `0`  → 方向垂直，语义无关
+- `-1` → 方向相反，语义相反
+
+为什么用余弦而不是欧氏距离？因为 Embedding 向量的**方向**代表语义，**长度**代表词频等无关因素。余弦只看方向，更准确。
+
+### 切块策略（带重叠）
+
+```ts
+function splitWithOverlap(text: string, chunkSize = 500, overlap = 100) {
+  const chunks: string[] = [];
+  let start = 0;
+  while (start < text.length) {
+    chunks.push(text.slice(start, start + chunkSize));
+    start += chunkSize - overlap;
+  }
+  return chunks;
+}
+```
+
+### Alibaba Embedding 正确调用方式
+
+```ts
+const alibaba = createAlibaba({
+  apiKey: process.env.alibaba_api_key,
+  baseURL: process.env.AI_gateway_url,                        // Chat 用 MaaS 网关
+  embeddingBaseURL: 'https://dashscope.aliyuncs.com/api/v1',  // Embedding 必须走标准地址
+});
+
+// RAG 场景区分 textType
+// 存文档时用 document
+await embedMany({
+  model: alibaba.embedding('text-embedding-v4'),
+  values: documents,
+  providerOptions: { alibaba: { textType: 'document' } },
+});
+
+// 查询时用 query
+await embed({
+  model: alibaba.embedding('text-embedding-v4'),
+  value: userQuestion,
+  providerOptions: { alibaba: { textType: 'query' } },
+});
+```
+
+### ⚠️ Alibaba Embedding 踩坑
+
+**坑1：API Key 无效**
+
+Embedding API 和 Chat API 走不同 endpoint，需要单独配 `embeddingBaseURL`。
+
+**坑2：MaaS 网关 404**
+
+`cn-beijing.maas.aliyuncs.com` 这类 MaaS 网关**不支持 Embedding**，必须用标准 DashScope 地址：
+- 国内：`https://dashscope.aliyuncs.com/api/v1`
+- 国际：`https://dashscope-intl.aliyuncs.com/api/v1`
+
+**可用模型：**
+
+| 模型 | 默认维度 | 支持维度 |
+|---|---|---|
+| `text-embedding-v4` | 1024 | 64~2048 |
+| `text-embedding-v3` | 1024 | 512~1024 |
+
+---
+
+## 学习路线总览
+
+```
+第一课：generateText / streamText    → LLM 调用基础
+第二课：Output.object() + Zod        → 结构化输出
+第三课：tool + isStepCount           → Tool Calling
+第四课：ToolLoopAgent                → 封装可复用 Agent
+第五课：messages 历史 / Memory 服务  → 让 Agent 记忆
+第六课：useChat + API Route          → 全栈 Web 应用
+第七课：embed + cosineSimilarity     → RAG 知识库
+第八课：多 Agent 系统                → 下一课
+```
