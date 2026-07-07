@@ -8,19 +8,25 @@ import {
   cosineSimilarity,
 } from "ai";
 import { createAlibaba } from "@ai-sdk/alibaba";
+import { createOpenAI } from "@ai-sdk/openai";
 import "dotenv/config";
 import { RAW_DOCUMENTS } from "@/lib/knowledge";
 import z from "zod";
 
 const alibaba = createAlibaba({
   baseURL: process.env.AI_gateway_url,
-  embeddingBaseURL: process.env.embedding_gateway_url,
+  embeddingBaseURL: "ollama",
   apiKey: process.env.alibaba_api_key,
+});
+
+const ollamaClient = createOpenAI({
+  baseURL: "http://localhost:11434/v1",
+  apiKey: "ollama",
 });
 
 // 1. 将文档转为向量数据并存储
 const { embeddings } = await embedMany({
-  model: alibaba.embedding("text-embedding-v4"),
+  model: ollamaClient.embedding("nomic-embed-text"),
   values: RAW_DOCUMENTS.map((doc) => `${doc.title}\n${doc.content}`),
   providerOptions: {
     alibaba: {
@@ -35,13 +41,8 @@ const vectorStore = RAW_DOCUMENTS.map((doc, index) => ({
 
 async function searchKnowledge(query: string, topK = 3) {
   const { embedding } = await embed({
-    model: alibaba.embedding("text-embedding-v4"),
+    model: ollamaClient.embedding("nomic-embed-text"),
     value: query,
-    providerOptions: {
-      alibaba: {
-        textType: "query",
-      },
-    },
   });
   return vectorStore
     .map((vector) => ({
@@ -79,17 +80,30 @@ const agent = new ToolLoopAgent({
           .describe("返回最相关的文档数，默认是3")
           .optional(),
       }),
-      async execute({ query, topK = 3 }) {
+      async *execute({ query, topK = 3 }) {
+        yield { status: "loading" as const };
         const documents = await searchKnowledge(query, topK);
-        return documents.map((doc) => doc.text);
+        yield { status: "success", result: documents.map((doc) => doc.text) };
       },
     }),
+  },
+  onStart({ modelId }) {
+    console.log(
+      `\n📊 [${new Date().toLocaleTimeString()}] 开始 | 模型: ${modelId}`,
+    );
+  },
+  onToolExecutionEnd({ toolCall, toolExecutionMs }) {
+    console.log(`🔧 工具: ${toolCall.toolName} | 耗时: ${toolExecutionMs}ms`);
+  },
+  onEnd({ usage, steps }) {
+    console.log(
+      `✅ 完成 | 步骤: ${steps.length} | tokens: ${usage.totalTokens}\n`,
+    );
   },
 });
 
 export async function POST(req: Request) {
   const { messages }: { messages: UIMessage[] } = await req.json();
-  console.log(messages);
   return createAgentUIStreamResponse({
     agent,
     uiMessages: messages,

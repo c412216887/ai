@@ -97,15 +97,22 @@ export default function PageView() {
                   );
                 }
                 if (p.type.startsWith("tool-") && "state" in p) {
-                  return ["input-streaming", "input-available"].includes(
-                    p.state,
-                  ) ? (
-                    <div key={index}>正在检索数据库</div>
-                  ) : p.state === "output-available" ? (
-                    <div key={index}>数据库检索完毕</div>
-                  ) : (
-                    <div key={index}>数据库检索出错</div>
-                  );
+                  if (
+                    ["input-streaming", "input-available"].includes(p.state!)
+                  ) {
+                    return <div key={index}>⏳ 查询中...</div>;
+                  }
+                  if (p.state === "output-available") {
+                    const output = p.output as {
+                      status: string;
+                      result?: unknown;
+                    };
+                    if (output.status === "loading") {
+                      return <div key={index}>🚀开始查询</div>;
+                    }
+                    return <div key={index}>数据库检索完毕</div>;
+                  }
+                  return <div key={index}>数据库检索出错</div>;
                 }
               })}
               {status === "submitted" && "AI思考中"}

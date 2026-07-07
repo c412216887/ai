@@ -721,6 +721,241 @@ The inferred type of 'xxx' cannot be named without a reference to 'JSONObject'
 
 **解决方案**：把 `ToolLoopAgent` 实例定义在使用它的文件里（通常是 `route.ts`），不要单独抽到 `lib/agent.ts` 再 export。
 
+---
+
+## 进阶能力
+
+### A：MCP（Model Context Protocol）
+
+#### 是什么
+
+标准化工具协议。工具服务化，任何 Agent 都能接入同一个 MCP 服务器，类似 USB 之于外设——统一接口，即插即用。
+
+社区已有大量现成 MCP Server：文件系统、GitHub、数据库、浏览器、Slack...
+
+#### 两种传输方式
+
+```ts
+// HTTP（生产推荐）
+const mcpClient = await createMCPClient({
+  transport: { type: 'http', url: 'https://mcp-server.example.com/mcp' },
+});
+
+// stdio（本地开发）
+import { Experimental_StdioMCPTransport } from '@ai-sdk/mcp/mcp-stdio';
+const mcpClient = await createMCPClient({
+  transport: new Experimental_StdioMCPTransport({
+    command: 'npx',
+    args: ['-y', '@modelcontextprotocol/server-filesystem', '/tmp'],
+  }),
+});
+```
+
+#### 完整用法
+
+```ts
+import { createMCPClient } from '@ai-sdk/mcp';           // ← 从 @ai-sdk/mcp 导入
+import { Experimental_StdioMCPTransport } from '@ai-sdk/mcp/mcp-stdio';
+import { streamText, type ToolSet, isStepCount } from 'ai';
+
+const mcpClient = await createMCPClient({ transport: ... });
+
+const tools = await mcpClient.tools() as ToolSet;  // 类型转换解决版本兼容问题
+console.log('可用工具:', Object.keys(tools));
+
+const result = streamText({
+  model: alibaba('qwen-max'),
+  tools,
+  stopWhen: isStepCount(10),
+  prompt: '...',
+  async onEnd() {
+    await mcpClient.close();  // 用完必须关闭
+  },
+});
+```
+
+#### ⚠️ 踩坑记录
+
+**坑1：导入路径**
+- `createMCPClient` → `@ai-sdk/mcp`（不是 `ai`）
+- `Experimental_StdioMCPTransport` → `@ai-sdk/mcp/mcp-stdio`
+
+**坑2：tools 类型不兼容**
+`@ai-sdk/mcp` v2 和 `ai` v7 内部类型有差异，用 `as ToolSet` 解决：
+```ts
+const tools = await mcpClient.tools() as ToolSet;
+```
+
+**坑3：`exactOptionalPropertyTypes: true` 会导致类型报错**
+在 `tsconfig.json` 中移除该选项即可。
+
+---
+
+### B：WorkflowAgent
+
+`ToolLoopAgent` 全部在内存跑，进程崩溃丢数据。`WorkflowAgent` 是持久化 Agent，每步都有检查点。
+
+| | ToolLoopAgent | WorkflowAgent |
+|---|---|---|
+| 包 | `ai` | `@ai-sdk/workflow` |
+| 进程崩溃 | 丢失 | 自动恢复 |
+| 工具失败 | 手动处理 | 自动重试 |
+| 依赖 | 无 | Vercel Workflow 平台 |
+
+**选型标准：**
+- 任务超过 15 分钟 → WorkflowAgent
+- 需要跨进程等待人工审批 → WorkflowAgent
+- 其他场景 → ToolLoopAgent 就够
+
+学习阶段用 ToolLoopAgent，生产长任务再考虑 WorkflowAgent。
+
+---
+
+### C：流式工具结果（Preliminary Tool Results）
+
+解决工具执行空白期问题：工具跑完前就能向前端推送进度。
+
+#### 核心：把 execute 改成 async generator
+
+```ts
+tool({
+  description: '搜索知识库',
+  inputSchema: z.object({ query: z.string() }),
+
+  async *execute({ query }) {
+    // 第1次 yield → output-available（中间状态）
+    yield { status: 'loading' as const, text: '搜索中...' };
+
+    const results = await searchKnowledge(query);
+
+    // 最后1次 yield → output-available（最终结果，传给 LLM）
+    yield { status: 'success' as const, results };
+  },
+})
+```
+
+**规则：**
+- 每次 `yield` 都产生一次 `output-available`
+- 后一次替换前一次（同一个 part，更新不追加）
+- 最后一次 yield 的值传给 LLM，中间的 LLM 看不到
+- `as const` 必须加，确保类型精确
+
+#### 前端渲染
+
+```tsx
+if (part.type.startsWith('tool-') && 'state' in part) {
+  if (part.state === 'output-available') {
+    const output = part.output as { status: 'loading' | 'success'; results?: unknown[] };
+
+    if (output.status === 'loading') {
+      return <div key={i}>🔍 搜索中...</div>;
+    }
+    return <div key={i}>✅ 搜索完毕</div>;
+  }
+}
+```
+
+---
+
+### D：Agent 可观测性
+
+#### 方式一：生命周期回调（开发调试用）
+
+```ts
+new ToolLoopAgent({
+  model: alibaba('qwen3.7-max'),
+  onToolExecutionStart({ toolCall }) {
+    console.log(`▶ ${toolCall.toolName}`, toolCall.input);
+  },
+  onToolExecutionEnd({ toolCall, toolExecutionMs }) {
+    console.log(`✓ ${toolCall.toolName} ${toolExecutionMs}ms`);
+  },
+  onEnd({ usage, steps }) {
+    console.log(`完成 | ${steps.length} 步 | ${usage.totalTokens} tokens`);
+  },
+});
+```
+
+#### 方式二：OpenTelemetry（生产推荐）
+
+```bash
+pnpm add @ai-sdk/otel
+```
+
+```ts
+// instrumentation.ts（项目根目录，Next.js 自动加载）
+import { registerTelemetry } from 'ai';
+import { OpenTelemetry } from '@ai-sdk/otel';
+
+export function register() {
+  registerTelemetry(new OpenTelemetry());
+  // 注册后所有 AI SDK 调用自动采集，不需要改业务代码
+}
+```
+
+#### 接入 Langfuse（免费 LLM 监控平台）
+
+```ts
+import { LangfuseExporter } from 'langfuse-vercel';
+
+registerTelemetry(
+  new OpenTelemetry({
+    exporter: new LangfuseExporter({
+      publicKey: process.env.LANGFUSE_PUBLIC_KEY,
+      secretKey: process.env.LANGFUSE_SECRET_KEY,
+    }),
+  }),
+);
+```
+
+能看到完整调用链路：每步耗时、token 用量、工具调用详情。
+
+#### 自定义 Telemetry（写到自己的数据库）
+
+```ts
+import type { Telemetry } from 'ai';
+
+class MyLogger implements Telemetry {
+  async onEnd({ usage, steps }) {
+    await db.insert({ tokens: usage.totalTokens, steps: steps.length });
+  }
+  async onToolExecutionEnd({ toolCall, toolExecutionMs }) {
+    console.log(`${toolCall.toolName}: ${toolExecutionMs}ms`);
+  }
+}
+
+registerTelemetry(new MyLogger());
+```
+
+#### 关闭特定调用
+
+```ts
+await generateText({
+  model: alibaba('qwen3.7-max'),
+  prompt: sensitiveData,
+  telemetry: { isEnabled: false },  // 这次不采集
+});
+```
+
+#### 使用 Ollama 本地 Embedding
+
+```ts
+import { createOpenAI } from '@ai-sdk/openai';
+
+const ollamaClient = createOpenAI({
+  baseURL: 'http://localhost:11434/v1',
+  apiKey: 'ollama',  // 随意填，本地不验证
+});
+
+const embeddingModel = ollamaClient.embedding('nomic-embed-text');
+// 维度：768，完全免费，本地运行
+// 启动：ollama serve & ollama pull nomic-embed-text
+```
+
+---
+
+## 学习路线总览
+
 ```
 第一课：generateText / streamText    → LLM 调用基础
 第二课：Output.object() + Zod        → 结构化输出
@@ -729,5 +964,10 @@ The inferred type of 'xxx' cannot be named without a reference to 'JSONObject'
 第五课：messages 历史 / Memory 服务  → 让 Agent 记忆
 第六课：useChat + API Route          → 全栈 Web 应用
 第七课：embed + cosineSimilarity     → RAG 知识库
-第八课：多 Agent 系统                → 下一课
+第八课：多 Agent 系统                → Subagent 编排
+
+进阶 A：MCP                         → 标准化工具协议
+进阶 B：WorkflowAgent               → 持久化 Agent（生产长任务）
+进阶 C：流式工具结果                 → 工具执行进度推送
+进阶 D：可观测性                     → OpenTelemetry + Langfuse
 ```
