@@ -601,7 +601,125 @@ Embedding API 和 Chat API 走不同 endpoint，需要单独配 `embeddingBaseUR
 
 ---
 
-## 学习路线总览
+## useChat 补充知识
+
+### message.parts 的所有 type
+
+`parts` 是一条消息的内容组成，一条消息可以同时包含多种类型：
+
+| type | 含义 | 常见场景 |
+|---|---|---|
+| `text` | 模型生成的文字 | 所有回答 |
+| `reasoning` | 模型的思维链（CoT） | Qwen3、o1 等思考模型 |
+| `tool-{工具名}` | 工具调用（动态命名）| 调用了工具的回答 |
+| `file` | 文件（图片、文档等）| 多模态场景 |
+| `source-url` | 网页来源引用 | Perplexity、Google 搜索模型 |
+| `source-document` | 文档来源引用 | 带引用的 RAG 场景 |
+| `step-start` | 多步骤的分隔标记 | Agent 多步执行 |
+| `data-{自定义名}` | 自定义数据部分 | 服务端推送自定义数据 |
+| `custom` | Provider 特有内容 | 特定模型的私有格式 |
+
+### tool part 的四个 state
+
+工具类型的 part（`tool-{名称}`）有独立的状态流转：
+
+```
+input-streaming  → LLM 正在生成工具参数（参数还没生成完）
+input-available  → 参数生成完毕，工具开始执行
+output-available → 工具执行完毕，有返回结果
+output-error     → 工具执行出错
+```
+
+渲染示例：
+
+```tsx
+m.parts.map((part, i) => {
+  if (part.type === 'text') {
+    return <span key={i}>{part.text}</span>
+  }
+
+  if (part.type === 'reasoning') {
+    return (
+      <details key={i}>
+        <summary>思考过程</summary>
+        <pre>{part.text}</pre>
+      </details>
+    )
+  }
+
+  if (part.type.startsWith('tool-') && 'state' in part) {
+    if (part.state === 'input-streaming' || part.state === 'input-available') {
+      return <span key={i}>🔍 正在搜索知识库...</span>
+    }
+    if (part.state === 'output-available') {
+      return <span key={i}>✅ 已检索知识库</span>
+    }
+    if (part.state === 'output-error') {
+      return <span key={i}>❌ 搜索失败</span>
+    }
+  }
+
+  return null
+})
+```
+
+### 流式事件 type（接口层）和 part type（UI 层）对应关系
+
+接口返回的原始流事件和 `useChat` 整理后的 `parts` 是两层：
+
+| 接口流事件 | 对应 part.type |
+|---|---|
+| `text-delta` | `text` |
+| `reasoning-delta` | `reasoning` |
+| `tool-call` + `tool-result` | `tool-{工具名}` |
+| `source` | `source-url` / `source-document` |
+| `file` | `file` |
+| `start-step` | `step-start` |
+
+`useChat` 把原始流事件收集整理成 `parts`，你渲染时只需要关心 `parts`，不需要自己处理流事件。
+
+### textType 的作用（Embedding）
+
+`textType` 告诉模型这段文字的用途，用于**非对称检索**优化：
+
+```ts
+textType: 'query'     // 用户的查询问题（问句腔）
+textType: 'document'  // 知识库的文档内容（陈述腔）
+```
+
+模型用不同编码策略处理两种文本，使语义相关的问题和文档向量距离更近，提升搜索精度。只有两个值，默认是 `document`。
+
+不同提供商的类似参数：
+
+| 提供商 | 参数名 | 额外支持的值 |
+|---|---|---|
+| 阿里云 | `textType` | `query` / `document` |
+| Cohere | `inputType` | + `classification` / `clustering` |
+| Voyage | `inputType` | `query` / `document` |
+| OpenAI | 无 | 不需要区分 |
+
+### useChat 常用返回值速查
+
+| 返回值 | 用途 |
+|---|---|
+| `messages` | 完整对话历史，渲染 UI |
+| `status` | `ready/submitted/streaming/error`，控制按钮禁用 |
+| `sendMessage` | 发消息，可带文件和额外参数 |
+| `stop` | 打断正在生成的回答 |
+| `regenerate` | 重新生成最后一条回答 |
+| `setMessages` | 本地改消息，不触发请求 |
+| `error` | 出错时有值 |
+| `addToolOutput` | 前端执行完工具后手动回传结果 |
+
+### ToolLoopAgent 不要跨文件 export
+
+`ToolLoopAgent` 实例的泛型参数包含了工具的完整类型，其中引用了 `@ai-sdk/provider` 内部的 `JSONObject`，该类型没有公开导出。跨文件 export 时 TypeScript 无法生成 `.d.ts`，报错：
+
+```
+The inferred type of 'xxx' cannot be named without a reference to 'JSONObject'
+```
+
+**解决方案**：把 `ToolLoopAgent` 实例定义在使用它的文件里（通常是 `route.ts`），不要单独抽到 `lib/agent.ts` 再 export。
 
 ```
 第一课：generateText / streamText    → LLM 调用基础

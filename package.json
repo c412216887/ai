@@ -13,10 +13,12 @@
   "packageManager": "pnpm@10.33.0",
   "dependencies": {
     "@ai-sdk/alibaba": "^2.0.2",
+    "@ai-sdk/openai": "^4.0.8",
     "@ai-sdk/react": "^4.0.12",
     "ai": "^7.0.4",
     "dotenv": "^17.4.2",
     "next": "^16.2.10",
+    "ollama-ai-provider-v2": "^3.6.0",
     "react": "^19.2.7",
     "react-dom": "^19.2.7",
     "tsx": "^4.22.4",
