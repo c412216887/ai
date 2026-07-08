@@ -1,13 +1,39 @@
 "use client";
 
 import { useChat } from "@ai-sdk/react";
-import { DefaultChatTransport } from "ai";
+import { DefaultChatTransport, type UIMessage } from "ai";
 import { useState, useRef, useEffect } from "react";
 
+const STORAGE_KEY = "chat-history";
+
+function loadHistory(): UIMessage[] {
+  try {
+    const raw = localStorage.getItem(STORAGE_KEY);
+    return raw ? JSON.parse(raw) : [];
+  } catch {
+    return [];
+  }
+}
+
+function saveHistory(messages: UIMessage[]) {
+  try {
+    localStorage.setItem(STORAGE_KEY, JSON.stringify(messages));
+  } catch {}
+}
+
 export default function Page() {
-  const { messages, sendMessage, status, stop } = useChat({
+  const [initialMessages] = useState<UIMessage[]>(() =>
+    typeof window !== "undefined" ? loadHistory() : []
+  );
+
+  const { messages, sendMessage, status, stop, setMessages } = useChat({
     transport: new DefaultChatTransport({ api: "/api/chat" }),
+    messages: initialMessages,
+    onFinish: ({ messages: allMessages }) => {
+      saveHistory(allMessages);
+    },
   });
+
   const [input, setInput] = useState("");
   const bottomRef = useRef<HTMLDivElement>(null);
 
@@ -15,11 +41,26 @@ export default function Page() {
     bottomRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [messages]);
 
+  function clearHistory() {
+    localStorage.removeItem(STORAGE_KEY);
+    setMessages([]);
+  }
+
   return (
     <div style={{ maxWidth: 720, margin: "0 auto", padding: "24px 16px", fontFamily: "system-ui, sans-serif" }}>
-      <h1 style={{ fontSize: 20, fontWeight: 700, marginBottom: 24, borderBottom: "1px solid #eee", paddingBottom: 12 }}>
-        📚 AI 知识库助手
-      </h1>
+      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 24, borderBottom: "1px solid #eee", paddingBottom: 12 }}>
+        <h1 style={{ fontSize: 20, fontWeight: 700, margin: 0 }}>
+          📚 AI 知识库助手
+        </h1>
+        {messages.length > 0 && (
+          <button
+            onClick={clearHistory}
+            style={{ fontSize: 12, color: "#999", background: "none", border: "1px solid #ddd", borderRadius: 6, padding: "4px 10px", cursor: "pointer" }}
+          >
+            清空对话
+          </button>
+        )}
+      </div>
 
       <div style={{ minHeight: 400, marginBottom: 16 }}>
         {messages.length === 0 && (
@@ -63,12 +104,13 @@ export default function Page() {
                 if (part.type === "text") {
                   return <span key={i} style={{ whiteSpace: "pre-wrap" }}>{part.text}</span>;
                 }
-                if (part.type.startsWith("tool-") && "state" in part && part.state === "input-available") {
-                  return (
-                    <span key={i} style={{ color: "#888", fontStyle: "italic", fontSize: 12 }}>
-                      🔍 正在搜索知识库...
-                    </span>
-                  );
+                if (part.type.startsWith("tool-") && "state" in part) {
+                  if (part.state === "input-streaming" || part.state === "input-available") {
+                    return <span key={i} style={{ color: "#888", fontStyle: "italic", fontSize: 12 }}>🔍 正在搜索知识库...</span>;
+                  }
+                  if (part.state === "output-available") {
+                    return <span key={i} style={{ color: "#52c41a", fontSize: 12 }}>✅ 搜索完成，生成回答中...</span>;
+                  }
                 }
                 return null;
               })}
