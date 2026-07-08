@@ -1,5 +1,7 @@
 import { createOpenAI } from "@ai-sdk/openai";
 import { embedMany, embed, cosineSimilarity } from "ai";
+import Database from "better-sqlite3";
+import path from "path";
 
 const ollamaClient = createOpenAI({
   baseURL: "http://localhost:11434/v1",
@@ -8,18 +10,12 @@ const ollamaClient = createOpenAI({
 
 const embeddingModel = ollamaClient.embedding("nomic-embed-text");
 
+const DB_PATH = path.join(process.cwd(), "knowledge.db");
+
 export interface Document {
   id: string;
   title: string;
   content: string;
-}
-
-export interface DocumentChunk {
-  id: string;
-  docId: string;
-  title: string;
-  content: string;
-  embedding: number[];
 }
 
 export const RAW_DOCUMENTS: Document[] = [
@@ -102,30 +98,80 @@ abortSignal 需要从主 Agent 透传到子 Agent，确保取消信号能正确�
   },
 ];
 
-let vectorStore: DocumentChunk[] = [];
+function openDb() {
+  const db = new Database(DB_PATH);
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS embeddings (
+      id TEXT PRIMARY KEY,
+      doc_id TEXT NOT NULL,
+      title TEXT NOT NULL,
+      content TEXT NOT NULL,
+      embedding BLOB NOT NULL
+    )
+  `);
+  return db;
+}
+
+function embeddingToBuffer(embedding: number[]): Buffer {
+  const buf = Buffer.allocUnsafe(embedding.length * 4);
+  embedding.forEach((v, i) => buf.writeFloatLE(v, i * 4));
+  return buf;
+}
+
+function bufferToEmbedding(buf: Buffer): number[] {
+  const result: number[] = [];
+  for (let i = 0; i < buf.length; i += 4) {
+    result.push(buf.readFloatLE(i));
+  }
+  return result;
+}
+
 let isInitialized = false;
 
 export async function initKnowledgeBase() {
   if (isInitialized) return;
+
+  const db = openDb();
+
+  const existingCount = (
+    db.prepare("SELECT COUNT(*) as count FROM embeddings").get() as { count: number }
+  ).count;
+
+  if (existingCount === RAW_DOCUMENTS.length) {
+    console.log(`✅ 知识库已存在（${existingCount} 篇），跳过向量化`);
+    isInitialized = true;
+    db.close();
+    return;
+  }
 
   console.log("🔧 初始化知识库，向量化文档中...");
 
   const { embeddings } = await embedMany({
     model: embeddingModel,
     values: RAW_DOCUMENTS.map((d) => `${d.title}\n${d.content}`),
-
   });
 
-  vectorStore = RAW_DOCUMENTS.map((doc, i) => ({
-    id: `chunk-${doc.id}`,
-    docId: doc.id,
-    title: doc.title,
-    content: doc.content,
-    embedding: embeddings[i] as number[],
-  }));
+  const insert = db.prepare(`
+    INSERT OR REPLACE INTO embeddings (id, doc_id, title, content, embedding)
+    VALUES (?, ?, ?, ?, ?)
+  `);
 
+  const insertAll = db.transaction(() => {
+    RAW_DOCUMENTS.forEach((doc, i) => {
+      insert.run(
+        `chunk-${doc.id}`,
+        doc.id,
+        doc.title,
+        doc.content,
+        embeddingToBuffer(embeddings[i] as number[]),
+      );
+    });
+  });
+
+  insertAll();
   isInitialized = true;
-  console.log(`✅ 知识库就绪，共 ${vectorStore.length} 篇文档`);
+  console.log(`✅ 知识库就绪，共 ${RAW_DOCUMENTS.length} 篇文档，已持久化到 SQLite`);
+  db.close();
 }
 
 export async function searchKnowledge(
@@ -137,14 +183,21 @@ export async function searchKnowledge(
   const { embedding: queryEmbedding } = await embed({
     model: embeddingModel,
     value: query,
-
   });
 
-  return vectorStore
-    .map((chunk) => ({
-      title: chunk.title,
-      content: chunk.content,
-      similarity: cosineSimilarity(queryEmbedding, chunk.embedding),
+  const db = openDb();
+  const rows = db.prepare("SELECT title, content, embedding FROM embeddings").all() as {
+    title: string;
+    content: string;
+    embedding: Buffer;
+  }[];
+  db.close();
+
+  return rows
+    .map((row) => ({
+      title: row.title,
+      content: row.content,
+      similarity: cosineSimilarity(queryEmbedding, bufferToEmbedding(row.embedding)),
     }))
     .sort((a, b) => b.similarity - a.similarity)
     .slice(0, topK);
