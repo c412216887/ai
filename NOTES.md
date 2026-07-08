@@ -862,6 +862,158 @@ notifications/resources/updated    → 资源内容更新通知
 
 这些方法名是全球统一约定，不是某个库发明的，就像 HTTP 的 GET/POST 一样。
 
+#### MCP 三种概念对比
+
+| 概念 | 控制方 | 用途 | LLM 是否参与 |
+|---|---|---|---|
+| Tools | **模型控制** | 执行操作，结果回传 LLM | ✅ LLM 主动调用 |
+| Resources | **应用控制** | 只读数据，注入 context | ❌ 应用代码读取后注入 prompt |
+| Prompts | **用户控制** | prompt 模板，用户触发 | ✅ 用户触发后作为消息发给 LLM |
+
+#### Resources 详解
+
+```ts
+// Server 注册固定资源
+server.registerResource(
+  'config',
+  'config://app',
+  { description: '应用配置', mimeType: 'application/json' },
+  async () => ({
+    contents: [{ uri: 'config://app', mimeType: 'application/json', text: JSON.stringify(data) }],
+  }),
+);
+
+// Server 注册动态资源模板（URI 带参数）
+server.registerResource(
+  'member-detail',
+  new ResourceTemplate('data://members/{name}', { list: undefined }),
+  { description: '按姓名查询成员', mimeType: 'application/json' },
+  async (uri, { name }) => ({
+    contents: [{ uri: uri.href, text: JSON.stringify(findMember(name)) }],
+  }),
+);
+
+// Client 读取（应用层主动，不经过 LLM）
+const { resources } = await mcpClient.listResources();
+const data = await mcpClient.readResource({ uri: 'config://app' });
+const text = data.contents[0]?.text;
+
+// 手动注入 prompt
+const { text: answer } = await generateText({
+  model: alibaba('qwen-max'),
+  prompt: `配置信息：${text}\n\n问题：...`,
+});
+```
+
+**Resource 的输出没有类型约束**，需要用 Zod 自己验证：
+
+```ts
+const raw = JSON.parse(data.contents[0]?.text ?? '{}');
+const config = ConfigSchema.parse(raw);
+```
+
+**Resource vs Tool 怎么选：**
+
+| 场景 | 用什么 |
+|---|---|
+| 数据量小、LLM 按需查询 | Tool |
+| 数据量大、提前全部注入 | Resource |
+| 需要实时感知数据变化 | Resource + subscribe |
+| 也可以把 Resource 封装成 Tool | 两者等价，Tool 让 LLM 主动触发 |
+
+#### Prompts 详解
+
+```ts
+// Server 注册 prompt 模板
+server.registerPrompt(
+  'code-review',
+  {
+    description: '代码审查',
+    argsSchema: {                           // ← 用 argsSchema，不是 arguments
+      code: z.string(),
+      language: z.string().optional(),
+    },
+  },
+  ({ code, language }) => ({
+    messages: [{
+      role: 'user',
+      content: { type: 'text', text: `请审查以下${language ?? ''}代码：\n${code}` },
+    }],
+  }),
+);
+
+// Client 获取 prompt
+const { prompts } = await mcpClient.experimental_listPrompts();
+const prompt = await mcpClient.experimental_getPrompt({
+  name: 'code-review',
+  arguments: { code: 'function add(a,b){return a+b}', language: 'JavaScript' },
+});
+
+// 把 prompt 消息直接传给 LLM
+const { text } = await generateText({
+  model: alibaba('qwen-max'),
+  messages: prompt.messages.map(m => ({
+    role: m.role as 'user' | 'assistant',
+    content: typeof m.content === 'string' ? m.content : m.content.text ?? '',
+  })),
+});
+```
+
+#### HTTP Transport 详解
+
+```ts
+// Server（独立运行，可部署）
+import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
+import express from 'express';
+
+const app = express();
+app.use(express.json());
+
+app.post('/mcp', async (req, res) => {
+  const server = createServer();
+  const transport = new StreamableHTTPServerTransport({
+    sessionIdGenerator: undefined,  // undefined = 无状态模式
+  });
+  await server.connect(transport);
+  await transport.handleRequest(req, res, req.body);
+});
+
+app.listen(3100);
+
+// Client 连接
+const mcpClient = await createMCPClient({
+  transport: { type: 'http', url: 'http://localhost:3100/mcp' },
+});
+```
+
+**stdio vs HTTP 对比：**
+
+| | stdio | HTTP |
+|---|---|---|
+| Server 启动 | Client 自动拉起 | 独立运行 |
+| 通信方式 | stdin/stdout | HTTP + SSE |
+| 适用范围 | 本地专用 | 可远程部署 |
+| 多 Client | ❌ 一对一 | ✅ 多 Client 共用 |
+
+#### 并行工具调用
+
+LLM 可以一次输出多个工具调用，SDK 并发执行：
+
+```ts
+// 同一个 step 里多个 tool-call
+for (const part of step.content) {
+  if (part.type === 'tool-call') {
+    console.log(part.toolName, part.input);
+  }
+}
+// getWeather { city: "北京" }
+// getWeather { city: "上海" }  ← 同时调用
+```
+
+- 独立查询 → LLM 自动并行，节省时间
+- 有依赖关系 → LLM 自动串行
+- Qwen 默认开启并行：`alibaba('qwen3.7-max', { parallelToolCalls: true })`
+
 ---
 
 ### B：WorkflowAgent
