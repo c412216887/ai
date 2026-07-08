@@ -789,6 +789,79 @@ const tools = await mcpClient.tools() as ToolSet;
 **坑3：`exactOptionalPropertyTypes: true` 会导致类型报错**
 在 `tsconfig.json` 中移除该选项即可。
 
+#### 自己写 MCP Server
+
+MCP 底层是 **JSON-RPC 2.0** 协议，通信格式是 JSON 消息。Server 和 Client 用什么语言、什么库都无所谓，只要遵守同一协议格式。
+
+**官方 SDK：**
+
+| 语言 | 包 |
+|---|---|
+| TypeScript | `@modelcontextprotocol/sdk` |
+| Python | `mcp` |
+| Java / Kotlin | `io.modelcontextprotocol:kotlin-sdk` |
+| C# | `ModelContextProtocol` |
+
+**用 `@modelcontextprotocol/sdk` 写 Server：**
+
+```ts
+import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
+import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
+import { z } from 'zod';
+
+const server = new McpServer({ name: 'my-server', version: '1.0.0' });
+
+// 注册工具（registerTool 是新 API，server.tool 已弃用）
+server.registerTool(
+  'add',
+  {
+    description: '计算两数之和',
+    inputSchema: { a: z.number(), b: z.number() },
+  },
+  async ({ a, b }) => ({
+    content: [{ type: 'text', text: String(a + b) }],
+  }),
+);
+
+const transport = new StdioServerTransport();
+await server.connect(transport);
+// stdio 模式禁止用 console.log（污染通信管道），用 process.stderr.write 打日志
+process.stderr.write('MCP Server 已启动\n');
+```
+
+**Client 连接自己的 Server：**
+
+```ts
+const mcpClient = await createMCPClient({
+  transport: new Experimental_StdioMCPTransport({
+    command: 'npx',
+    args: ['tsx', './mcp-server.ts'],  // Client 启动时自动拉起 Server 进程
+  }),
+});
+```
+
+#### MCP 协议约定的方法（所有 Server 必须支持）
+
+```
+initialize                         → 握手，协商版本和能力
+notifications/initialized          → Client 告知初始化完成
+
+tools/list                         → 列出所有工具
+tools/call                         → 调用某个工具
+
+resources/list                     → 列出所有资源
+resources/read                     → 读取资源内容
+resources/subscribe                → 订阅资源变更
+
+prompts/list                       → 列出所有 prompt 模板
+prompts/get                        → 获取某个 prompt
+
+notifications/tools/list_changed   → 工具列表变更通知
+notifications/resources/updated    → 资源内容更新通知
+```
+
+这些方法名是全球统一约定，不是某个库发明的，就像 HTTP 的 GET/POST 一样。
+
 ---
 
 ### B：WorkflowAgent
