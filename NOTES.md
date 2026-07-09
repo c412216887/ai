@@ -1179,7 +1179,36 @@ const embeddingModel = ollamaClient.embedding('nomic-embed-text');
 
 ---
 
-## 学习路线总览
+## 后续深入方向
+
+根据前端 + B端项目背景，按价值排序：
+
+### 方向一：LangGraph（最值得投入）
+
+AI SDK 适合快速开发，但复杂 Agent 工作流（条件分支、循环、并行）需要更结构化的框架。LangGraph 是目前最流行的 Agent 编排框架，面试高频考点。
+
+- 核心概念：图（Graph）、节点（Node）、状态（State）、边（Edge）
+- 解决问题：多步骤、有分支、可回溯的复杂 Agent 工作流
+- 学习曲线：中等，1-2 周入门
+
+### 方向二：Tool 高级用法
+
+- Human-in-the-loop：工具执行前请求人工审批（`toolApproval`）
+- 工具失败重试：模型自动修正参数重试
+- 流式工具结果实践（已理解原理）
+
+### 方向三：Prompt Engineering 系统化
+
+- Chain of Thought、Few-shot、ReAct 范式
+- System Prompt 的结构化设计
+- 用 Langfuse 追踪和优化 prompt 效果
+
+### 方向四：做真实 B端 AI 工具
+
+把学的东西用在实际项目里：
+- 表格数据分析助手（自然语言查数据）
+- 操作引导 Agent（用户说需求，自动生成表单）
+- 内部文档问答（公司文档喂给 RAG）
 
 ```
 第一课：generateText / streamText    → LLM 调用基础
