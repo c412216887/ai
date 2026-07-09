@@ -1196,3 +1196,115 @@ const embeddingModel = ollamaClient.embedding('nomic-embed-text');
 进阶 C：流式工具结果                 → 工具执行进度推送
 进阶 D：可观测性                     → OpenTelemetry + Langfuse
 ```
+
+---
+
+## 知识库助手项目完善记录
+
+### 对话历史持久化（localStorage）
+
+```ts
+const STORAGE_KEY = 'chat-history';
+
+function loadHistory(): UIMessage[] {
+  try {
+    return JSON.parse(localStorage.getItem(STORAGE_KEY) ?? '[]');
+  } catch { return []; }
+}
+
+function saveHistory(messages: UIMessage[]) {
+  localStorage.setItem(STORAGE_KEY, JSON.stringify(messages));
+}
+
+const [initialMessages] = useState<UIMessage[]>(() =>
+  typeof window !== 'undefined' ? loadHistory() : []
+);
+
+const { messages } = useChat({
+  messages: initialMessages,            // 注意：是 messages 不是 initialMessages
+  onFinish: ({ messages: all }) => saveHistory(all),
+});
+```
+
+**关键理解：**
+- `messages` 参数只用于初始化，之后由 `useChat` 内部接管
+- `onFinish` 里的 `messages` 是 `useChat` 内部维护的完整列表，每次回答完自动包含全部历史
+- 每轮对话，`useChat` 自动把所有历史 messages 发给后端，LLM 靠完整历史实现多轮记忆
+
+### 向量持久化（SQLite）
+
+向量是 `number[]`，不能直接存数据库，要转成二进制 Buffer：
+
+```ts
+function embeddingToBuffer(embedding: number[]): Buffer {
+  const buf = Buffer.allocUnsafe(embedding.length * 4);
+  embedding.forEach((v, i) => buf.writeFloatLE(v, i * 4));
+  return buf;
+}
+
+function bufferToEmbedding(buf: Buffer): number[] {
+  const result: number[] = [];
+  for (let i = 0; i < buf.length; i += 4) result.push(buf.readFloatLE(i));
+  return result;
+}
+```
+
+**为什么每个数占 4 字节：** IEEE 754 float32 标准，32位 = 4字节，768维向量 = 3072字节。
+
+**为什么不用 JSON.stringify：**
+- 空间：JSON 约 7680 字节 vs 二进制 3072 字节，大 2.5 倍
+- 精度：JSON 字符串转回浮点有精度损失，影响相似度计算
+
+**启动时判断逻辑：**
+
+```ts
+const count = db.prepare('SELECT COUNT(*) as count FROM embeddings').get().count;
+if (count === RAW_DOCUMENTS.length) {
+  // 已存在，跳过向量化
+  return;
+}
+// 否则向量化并写入
+```
+
+### 普通数据库 vs 向量数据库
+
+所有能存 BLOB 的数据库都能存向量，区别在检索算法：
+
+| | 普通数据库（SQLite） | 向量数据库（Pinecone/Qdrant）|
+|---|---|---|
+| 存储 | ✅ BLOB | ✅ 专用格式 |
+| 检索 | 暴力 O(n)，全表扫描 | 近似 O(log n)，HNSW/IVF 索引 |
+| 适合规模 | < 1 万条 | > 1 万条 |
+
+### RAG 两阶段检索
+
+```
+阶段一（粗召回）：embedding 余弦相似度，快速取 Top20
+阶段二（精排）：rerank 模型对候选重新打分，取最终 Top3
+
+→ 粗召回快但不精，精排慢但准，组合使用兼顾速度和精度
+```
+
+**RAG 三个评估指标：**
+- 忠实度（Faithfulness）：回答是否基于文档，没有编造
+- 答案相关性（Answer Relevancy）：是否真正回答了问题
+- 上下文精确率（Context Precision）：检索到的文档是否真的有用
+
+### 生产部署注意事项
+
+本地 vs 生产环境的核心差异：
+
+| 依赖 | 本地 | 生产（Vercel）|
+|---|---|---|
+| Embedding | Ollama 本地 | 需要云端 API |
+| 向量存储 | SQLite 文件 | 云端数据库 或 预计算 JSON |
+| 环境变量 | `.env` 文件 | 平台面板配置 |
+
+**离线预计算方案**（解决 Ollama 不能在云端运行的问题）：
+
+```bash
+# 本地运行一次，生成向量文件
+npx tsx scripts/build-vectors.ts
+# → 生成 lib/vectors.json，提交到仓库
+# → 生产环境直接读文件，不需要 Ollama
+```
